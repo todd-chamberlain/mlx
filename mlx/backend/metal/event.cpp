@@ -1,6 +1,7 @@
 // Copyright © 2024 Apple Inc.
 
 #include "mlx/backend/metal/event.h"
+#include "mlx/backend/metal/device.h"
 #include "mlx/scheduler.h"
 
 namespace mlx::core {
@@ -49,11 +50,36 @@ void Event::wait() {
   check_error();
 }
 
+namespace {
+
+// Flush every GPU stream's pending command buffer. Used before blocking the
+// host on a CPU-signaled event: the CPU work may itself depend on GPU work
+// that is still sitting unencoded/uncommitted in these buffers (see #4556).
+void commit_all_gpu_streams() {
+  auto pool = metal::new_scoped_memory_pool();
+  for (auto& [index, encoder] : metal::get_command_encoders()) {
+    encoder.end_encoding();
+    encoder.commit();
+  }
+}
+
+} // namespace
+
 void Event::wait(Stream stream) {
   if (stream.device == Device::cpu) {
     scheduler::wait_event(stream, *this, [value = value()](Event& self) {
       self.cast<metal::EventImpl>().wait(value);
     });
+  } else if (this->stream().device == Device::cpu) {
+    // The event will be signaled from a CPU stream (e.g. a distributed
+    // collective, or any slow CPU op). Encoding a hardware wait would leave a
+    // *committed* command buffer blocked on host work of unbounded duration,
+    // and Metal's command-buffer watchdog (~5s) then fails it with
+    // kIOGPUCommandBufferCallbackErrorTimeout. The GPU has nothing to do
+    // until the host signals anyway, so perform the wait on the host instead:
+    // flush pending GPU work first (the CPU work may depend on it), then block.
+    commit_all_gpu_streams();
+    wait();
   } else {
     auto& encoder = metal::get_command_encoder(stream);
     encoder.wait_event(*this, value());

@@ -258,5 +258,43 @@ class TestEval(mlx_tests.MLXTestCase):
         self.assertEqual((mx.ones((4,), stream=mx.cpu) + 1).sum().item(), 8.0)
 
 
+class TestCpuSignaledWait(mlx_tests.MLXTestCase):
+    def test_gpu_consumer_of_slow_cpu_stream_op(self):
+        # Regression test for the Metal command-buffer watchdog
+        # (kIOGPUCommandBufferCallbackErrorTimeout): a GPU op that depends,
+        # within one eval, on CPU-stream work taking longer than ~5s used to
+        # fail because the wait was encoded into a committed command buffer.
+        # The wait is now performed on the host.
+        if not mx.metal.is_available():
+            return
+        import time
+
+        cpu = mx.new_stream(mx.cpu)
+        x = mx.random.normal((20_000_000,))
+        mx.eval(x)
+        t = time.time()
+        y = mx.sort(x, stream=cpu)
+        mx.eval(y)
+        per_sort = max(time.time() - t, 0.05)
+        # Size the CPU chain so the GPU consumer's dependency lasts >= 6.5s.
+        k = int(6.5 / per_sort) + 2
+        # Each link re-sorts the *unsorted* input (sorting sorted data is fast)
+        # and depends on the previous link; every op stays on the CPU stream so
+        # the GPU consumer below waits on one serial > 5s dependency.
+        y = mx.sort(x, stream=cpu)
+        for _ in range(k):
+            zero = mx.multiply(mx.sum(y, stream=cpu), 0.0, stream=cpu)
+            y = mx.sort(mx.add(x, zero, stream=cpu), stream=cpu)
+        z = y * 2.0  # GPU consumer of the slow CPU chain, same eval
+        t = time.time()
+        mx.eval(z)  # must not raise
+        elapsed = time.time() - t
+        self.assertEqual(z.shape, x.shape)
+        # Only meaningful if the dependency actually outlasted the ~5s window.
+        self.assertGreater(
+            elapsed, 5.5, f"CPU chain too short to exercise the watchdog ({elapsed:.1f}s)"
+        )
+
+
 if __name__ == "__main__":
     mlx_tests.MLXTestRunner()
