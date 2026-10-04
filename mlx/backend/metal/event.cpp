@@ -1,5 +1,8 @@
 // Copyright © 2024 Apple Inc.
 
+#include <cstdlib>
+#include <string>
+
 #include "mlx/backend/metal/event.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/scheduler.h"
@@ -28,6 +31,22 @@ EventImpl::~EventImpl() {
 
 void EventImpl::wait(uint64_t value) {
   mtl_event_->waitUntilSignaledValue(value, -1); // never times out
+}
+
+bool EventImpl::wait(uint64_t value, int64_t timeout_ms) {
+  if (timeout_ms <= 0) {
+    wait(value);
+    return true;
+  }
+  return mtl_event_->waitUntilSignaledValue(value, timeout_ms);
+}
+
+int64_t host_wait_timeout_ms() {
+  static const int64_t v = [] {
+    const char* s = std::getenv("MLX_HOST_WAIT_TIMEOUT_MS");
+    return s ? std::strtoll(s, nullptr, 10) : int64_t(0);
+  }();
+  return v;
 }
 
 void EventImpl::signal(uint64_t value) {
@@ -79,7 +98,15 @@ void Event::wait(Stream stream) {
     // until the host signals anyway, so perform the wait on the host instead:
     // flush pending GPU work first (the CPU work may depend on it), then block.
     commit_all_gpu_streams();
-    wait();
+    check_error();
+    auto timeout = metal::host_wait_timeout_ms();
+    if (!cast<metal::EventImpl>().wait(value(), timeout)) {
+      throw std::runtime_error(
+          "[Event::wait] Timed out after " + std::to_string(timeout) +
+          " ms waiting for a CPU-signaled event (MLX_HOST_WAIT_TIMEOUT_MS). "
+          "A peer in a distributed collective may have died or hung.");
+    }
+    check_error();
   } else {
     auto& encoder = metal::get_command_encoder(stream);
     encoder.wait_event(*this, value());

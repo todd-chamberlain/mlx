@@ -1,5 +1,10 @@
 // Copyright © 2024 Apple Inc.
+#include <chrono>
+#include <string>
+#include <thread>
+
 #include "mlx/fence.h"
+#include "mlx/backend/metal/event.h"
 #include "mlx/backend/metal/device.h"
 #include "mlx/scheduler.h"
 #include "mlx/utils.h"
@@ -76,7 +81,17 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
         encoder.commit();
       }
     }
+    auto timeout = metal::host_wait_timeout_ms();
+    auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout > 0 ? timeout : 0);
     while (f.cpu_value()[0] < value) {
+      if (timeout > 0 && std::chrono::steady_clock::now() > deadline) {
+        throw std::runtime_error(
+            "[Fence::wait] Timed out after " + std::to_string(timeout) +
+            " ms waiting for a CPU-signaled fence (MLX_HOST_WAIT_TIMEOUT_MS). "
+            "A peer in a distributed collective may have died or hung.");
+      }
+      std::this_thread::yield();
     }
     return;
   }
