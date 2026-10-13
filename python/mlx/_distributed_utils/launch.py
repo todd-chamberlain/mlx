@@ -198,7 +198,10 @@ def _launch_with_io(command_class, arguments, verbose):
                 stdin_buffer += stdin_queue.get_nowait()
             except QueueEmpty:
                 pass
-            rlist, wlist, _ = select(to_read, to_write, [], 1.0)
+            # A pipe is almost always writable, so wait on stdin only with
+            # data to send.
+            writers = to_write if stdin_buffer else []
+            rlist, wlist, _ = select(to_read, writers, [], 0.1)
             for fd in rlist:
                 is_stdout = fd == p.stdout.fileno()
                 msg = os.read(fd, 8192).decode(errors="ignore")
@@ -247,11 +250,15 @@ def _launch_with_io(command_class, arguments, verbose):
     os.set_blocking(sys.stdin.fileno(), False)
     os.set_blocking(sys.stdout.fileno(), True)
     os.set_blocking(sys.stderr.fileno(), True)
+    # At end of file stdin is always readable, so stop waiting on it then.
+    readers = [sys.stdin.fileno()]
     while not stop or any(not q.empty() for q in chain(stdout_queues, stderr_queues)):
         # Broadcast user input to the jobs
-        rlist, _, _ = select([sys.stdin.fileno()], [], [], 0.1)
+        rlist, _, _ = select(readers, [], [], 0.1)
         for fd in rlist:
             stdin_buffer = os.read(fd, 8192)
+            if not stdin_buffer:
+                readers = []
             for q in stdin_queues:
                 q.put(stdin_buffer)
 
