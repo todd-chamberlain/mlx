@@ -4,12 +4,10 @@
 
 #include <infiniband/verbs.h>
 
-#include <chrono>
 #include <functional>
 #include <mutex>
 #include <span>
 #include <sstream>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -155,29 +153,6 @@ class SharedBuffer {
  *   - Sending and receiving
  *   - Checking completion
  */
-// A poll returns at once. When no work has completed for a while, sleep
-// between polls so that a long wait does not use a full CPU core.
-class PollBackoff {
- public:
-  void operator()(int completions) {
-    auto now = std::chrono::steady_clock::now();
-    if (completions > 0 || !idle_) {
-      idle_ = completions == 0;
-      idle_since_ = now;
-    } else if (now - idle_since_ > spin_) {
-      std::this_thread::sleep_for(sleep_);
-    }
-  }
-
- private:
-  static constexpr std::chrono::microseconds spin_{1000};
-  static constexpr std::chrono::microseconds sleep_{50};
-  bool idle_ = false;
-  std::chrono::steady_clock::time_point idle_since_;
-};
-
-inline thread_local PollBackoff poll_backoff;
-
 struct Connection {
   ibv_context* ctx;
   ibv_pd* protection_domain;
@@ -240,16 +215,14 @@ struct Connection {
   }
 
   int poll(int num_completions, ibv_wc* work_completions) {
-    int n = ibv_poll_cq(completion_queue, num_completions, work_completions);
-    poll_backoff(n);
-    return n;
+    return ibv_poll_cq(completion_queue, num_completions, work_completions);
   }
 };
 
 std::vector<Connection> create_connections(
     const std::vector<std::string>& device_names);
 
-inline int poll_each(
+inline int poll(
     std::span<const Connection> connections,
     int num_completions,
     ibv_wc* work_completions) {
@@ -273,25 +246,16 @@ inline int poll_each(
 }
 
 inline int poll(
-    std::span<const Connection> connections,
-    int num_completions,
-    ibv_wc* work_completions) {
-  int completions = poll_each(connections, num_completions, work_completions);
-  poll_backoff(completions);
-  return completions;
-}
-
-inline int poll(
     std::span<const Connection> connections_1,
     std::span<const Connection> connections_2,
     int num_completions,
     ibv_wc* work_completions) {
-  int completions = poll_each(connections_1, num_completions, work_completions);
-  completions += poll_each(
+  int completions = 0;
+  completions += poll(connections_1, num_completions, work_completions);
+  completions += poll(
       connections_2,
       num_completions - completions,
       work_completions + completions);
-  poll_backoff(completions);
   return completions;
 }
 
