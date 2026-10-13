@@ -33,6 +33,9 @@ def get_version():
             if "#define MLX_VERSION_PATCH" in line:
                 patch = line.split()[-1]
     version = f"{major}.{minor}.{patch}"
+    # A local version label (PEP 440) for builds of a patched release.
+    if local := os.environ.get("MLX_LOCAL_VERSION"):
+        return f"{version}+{local}"
     pypi_release = int(os.environ.get("PYPI_RELEASE", 0))
     dev_release = int(os.environ.get("DEV_RELEASE", 0))
     if not pypi_release or dev_release:
