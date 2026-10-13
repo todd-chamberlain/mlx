@@ -199,7 +199,8 @@ def _launch_with_io(command_class, arguments, verbose):
                 stdin_buffer += stdin_queue.get_nowait()
             except QueueEmpty:
                 pass
-            rlist, wlist, _ = select(to_read, to_write, [], 0 if exited else 1.0)
+            writers = to_write if stdin_buffer else []
+            rlist, wlist, _ = select(to_read, writers, [], 0 if exited else 0.1)
             for fd in rlist:
                 is_stdout = fd == p.stdout.fileno()
                 try:
@@ -260,11 +261,14 @@ def _launch_with_io(command_class, arguments, verbose):
     os.set_blocking(sys.stdin.fileno(), False)
     os.set_blocking(sys.stdout.fileno(), True)
     os.set_blocking(sys.stderr.fileno(), True)
+    readers = [sys.stdin.fileno()]
     while not stop or any(not q.empty() for q in chain(stdout_queues, stderr_queues)):
         # Broadcast user input to the jobs
-        rlist, _, _ = select([sys.stdin.fileno()], [], [], 0.1)
+        rlist, _, _ = select(readers, [], [], 0.1)
         for fd in rlist:
             stdin_buffer = os.read(fd, 8192)
+            if not stdin_buffer:
+                readers = []
             for q in stdin_queues:
                 q.put(stdin_buffer)
 
