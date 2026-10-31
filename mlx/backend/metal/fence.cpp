@@ -1,16 +1,20 @@
 // Copyright © 2024 Apple Inc.
 #include "mlx/fence.h"
 
+#include <chrono>
 #include <optional>
+#include <string>
+#include <thread>
 
 #include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/event.h"
 #include "mlx/scheduler.h"
 #include "mlx/utils.h"
 
 namespace mlx::core {
 
 struct FenceImpl {
-  FenceImpl(Stream stream) {
+  FenceImpl(Stream stream) : stream(stream) {
     auto d = metal::device(stream.device).mtl_device();
     if (!d->supportsFamily(MTL::GPUFamilyMetal3)) {
       use_fast = false;
@@ -26,6 +30,7 @@ struct FenceImpl {
     }
   }
 
+  Stream stream; // the stream whose work this fence tracks (the signaling side)
   bool use_fast{false};
   uint32_t count{0};
   std::optional<allocator::Data> fence;
@@ -60,6 +65,33 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
       while (f.cpu_value()[0] < value) {
       }
     });
+    return;
+  }
+
+  if (f.stream.device == Device::cpu) {
+    // Fast-synch variant of the hazard handled in Event::wait: a GPU
+    // ``fence_wait`` spin kernel waiting on a host-updated value has no
+    // bound and trips the command-buffer watchdog. Flush pending GPU work
+    // and spin on the host instead.
+    {
+      auto pool = metal::new_scoped_memory_pool();
+      for (auto& [index, encoder] : metal::get_command_encoders()) {
+        encoder.end_encoding();
+        encoder.commit();
+      }
+    }
+    auto timeout = metal::host_wait_timeout_ms();
+    auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout > 0 ? timeout : 0);
+    while (f.cpu_value()[0] < value) {
+      if (timeout > 0 && std::chrono::steady_clock::now() > deadline) {
+        throw std::runtime_error(
+            "[Fence::wait] Timed out after " + std::to_string(timeout) +
+            " ms waiting for a CPU-signaled fence (MLX_HOST_WAIT_TIMEOUT_MS). "
+            "A peer in a distributed collective may have died or hung.");
+      }
+      std::this_thread::yield();
+    }
     return;
   }
 
